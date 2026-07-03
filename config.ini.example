@@ -18,6 +18,18 @@ debug = false
 ; Enable only when this webhook is behind a trusted reverse proxy.
 ; When true, uses the first IP in the X-Forwarded-For header as the source.
 trust_forwarded_for = false
+; Optional HTTP Basic Auth for POST requests. Keep disabled unless required.
+basic_auth_enabled = false
+; Username is stored here; keep the password only in the named environment variable.
+basic_auth_username = webhook
+basic_auth_password_env = WEBHOOK_BASIC_AUTH_PASSWORD
+; Optional PBKDF2 password-hash file. When set, it has priority over the
+; environment variable. Create it with --create-basic-auth-password-file.
+basic_auth_password_file =
+basic_auth_realm = Webhook Intake
+; Do not enable outside controlled networks. Basic Auth must use HTTPS when
+; the webhook listens beyond loopback; loopback is allowed for a trusted TLS proxy.
+basic_auth_allow_insecure = false
 ; Enable direct HTTPS using the certificate and key paths below.
 tls_enabled = false
 ; When true and both TLS files are absent, create a local self-signed certificate.

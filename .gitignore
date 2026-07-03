@@ -17,6 +17,7 @@ output/*
 # Local configuration and common files
 config.ini
 !config.ini.example
+.faj383hfa
 tls/
 .env
 .env.*

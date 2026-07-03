@@ -17,8 +17,12 @@ also required only when generating a self-signed TLS certificate.
 from __future__ import annotations
 
 import argparse
+import base64
 import configparser
 import errno
+import getpass
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -30,7 +34,9 @@ import stat
 import subprocess
 import sys
 import threading
+import tempfile
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,10 +44,145 @@ from typing import Any
 
 JSONL_SUFFIXES = {".jsonl", ".ndjson"}
 YAML_SUFFIXES = {".yaml", ".yml"}
+PBKDF2_ITERATIONS = 600_000
+# File delivery is bounded by default. A profile can override each value, or
+# set rotate_max_bytes = 0 to deliberately disable rotation for that profile.
+DEFAULT_ROTATE_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_ROTATE_KEEP = 10
+DEFAULT_ROTATION_MODE = "rename"
+
+
+@dataclass(frozen=True)
+class BasicAuth:
+    """Optional Basic Auth verifier backed by a password or a PBKDF2 hash."""
+
+    username: bytes
+    realm: str
+    password: bytes | None = None
+    salt: bytes | None = None
+    iterations: int | None = None
+    digest: bytes | None = None
+
+    def verify_password(self, candidate: bytes) -> bool:
+        if self.password is not None:
+            return hmac.compare_digest(candidate, self.password)
+        assert self.salt is not None and self.iterations is not None and self.digest is not None
+        derived = hashlib.pbkdf2_hmac("sha256", candidate, self.salt, self.iterations)
+        return hmac.compare_digest(derived, self.digest)
 
 
 class DeliveryError(Exception):
     """Failure in a delivery configured as required."""
+
+
+def parse_password_hash_file(path: Path) -> tuple[bytes, int, bytes]:
+    """Reads a strict PBKDF2 password record and rejects broadly readable files."""
+    try:
+        mode = path.stat().st_mode & 0o777
+        if mode & 0o077:
+            raise ValueError(f"Basic Auth password file must not be group/world readable: {path}")
+        algorithm, iterations, salt, digest = path.read_text(encoding="utf-8").strip().split("$")
+        if algorithm != "pbkdf2_sha256":
+            raise ValueError("unsupported Basic Auth password file algorithm")
+        parsed_iterations = int(iterations)
+        if parsed_iterations < 100_000:
+            raise ValueError("Basic Auth password file uses too few PBKDF2 iterations")
+        return (
+            base64.b64decode(salt, validate=True),
+            parsed_iterations,
+            base64.b64decode(digest, validate=True),
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"invalid Basic Auth password file {path}: {exc}") from exc
+
+
+def password_hash_record(password: str) -> str:
+    """Returns a salted PBKDF2-SHA256 record suitable for a local password file."""
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    return "$".join((
+        "pbkdf2_sha256",
+        str(PBKDF2_ITERATIONS),
+        base64.b64encode(salt).decode("ascii"),
+        base64.b64encode(digest).decode("ascii"),
+    ))
+
+
+def create_basic_auth_password_file(path: Path) -> None:
+    """Prompts twice and atomically creates or replaces a mode-0600 password hash file."""
+    try:
+        password = getpass.getpass("Basic Auth password: ")
+        confirmation = getpass.getpass("Confirm Basic Auth password: ")
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise ValueError("password file creation cancelled") from exc
+    if not password:
+        raise ValueError("Basic Auth password must not be empty")
+    if not hmac.compare_digest(password, confirmation):
+        raise ValueError("password confirmation does not match")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(password_hash_record(password) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, path)
+        path.chmod(0o600)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def load_basic_auth(config: dict[str, Any]) -> BasicAuth | None:
+    """Loads optional Basic Auth credentials, keeping the password in an environment variable."""
+    if not config.get("basic_auth_enabled", False):
+        return None
+    username = config.get("basic_auth_username", "")
+    password_file = config.get("basic_auth_password_file")
+    password_env = config.get("basic_auth_password_env", "WEBHOOK_BASIC_AUTH_PASSWORD")
+    password = os.environ.get(password_env)
+    realm = config.get("basic_auth_realm", "Webhook Intake")
+    if not username:
+        raise ValueError("basic_auth_username is required when Basic Auth is enabled")
+    if password_file:
+        salt, iterations, digest = parse_password_hash_file(Path(password_file))
+        return BasicAuth(username.encode("utf-8"), realm, salt=salt, iterations=iterations, digest=digest)
+    if not password:
+        raise ValueError(f"environment variable {password_env} is required when Basic Auth is enabled")
+    if "\r" in realm or "\n" in realm:
+        raise ValueError("basic_auth_realm must not contain a line break")
+    return BasicAuth(username.encode("utf-8"), realm, password=password.encode("utf-8"))
+
+
+def is_loopback_host(host: str) -> bool:
+    """Returns whether a bind host is restricted to the local machine."""
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def basic_auth_is_valid(header: str | None, credentials: BasicAuth) -> bool:
+    """Decodes and compares an HTTP Basic credential using constant-time comparisons."""
+    if not header:
+        return False
+    scheme, separator, encoded = header.partition(" ")
+    if scheme.lower() != "basic" or not separator or not encoded:
+        return False
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+        username, password = decoded.split(b":", 1)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    password_valid = credentials.verify_password(password)
+    username_valid = hmac.compare_digest(username, credentials.username)
+    return username_valid and password_valid
 
 
 def create_self_signed_certificate(cert_file: Path, key_file: Path, common_name: str, days: int) -> None:
@@ -110,6 +251,17 @@ def update_ini_values(path: Path, values: dict[str, str]) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def ensure_local_config(config_path: Path) -> bool:
+    """Creates a missing local INI configuration from its adjacent example file."""
+    if config_path.exists():
+        return False
+    example_path = config_path.with_name(f"{config_path.name}.example")
+    if not example_path.is_file():
+        raise ValueError(f"configuration file is missing and no template was found at {example_path}")
+    shutil.copy2(example_path, config_path)
+    return True
+
+
 def run_certbot_mode(config_path: Path, ip_address: str, email: str, staging: bool, assume_yes: bool) -> None:
     """Requests a public IP certificate with Certbot, configures TLS, then exits.
 
@@ -173,16 +325,27 @@ def run_certbot_mode(config_path: Path, ip_address: str, email: str, staging: bo
         raise ValueError("Certbot completed but did not create the expected certificate files")
     shutil.copy2(issued_cert, destination_cert)
     shutil.copy2(issued_key, destination_key)
+    # In a systemd deployment, the TLS directory is owned by the unprivileged
+    # service account. Preserve that ownership when Certbot runs as root.
+    tls_directory_stat = tls_dir.stat()
+    try:
+        os.chown(destination_cert, tls_directory_stat.st_uid, tls_directory_stat.st_gid)
+        os.chown(destination_key, tls_directory_stat.st_uid, tls_directory_stat.st_gid)
+    except PermissionError:
+        # A non-root interactive invocation already owns its destination files.
+        pass
     destination_key.chmod(0o600)
+    created_config = ensure_local_config(config_path)
     update_ini_values(config_path, {
         "tls_enabled": "true",
         "tls_self_signed": "false",
         "tls_cert_file": "./tls/webhook-intake.crt",
         "tls_key_file": "./tls/webhook-intake.key",
     })
+    config_notice = " A new local config.ini was created from config.ini.example." if created_config else ""
     print(
         f"Certificate request succeeded. HTTPS is configured in {config_path}; "
-        f"certificate: {destination_cert}; key: {destination_key}",
+        f"certificate: {destination_cert}; key: {destination_key}.{config_notice}",
         flush=True,
     )
 
@@ -388,7 +551,7 @@ class App:
         but they can miss unread data at truncation time.
         """
         archive = self.rotation_archive_path(destination)
-        mode = profile.get("rotation_mode", "rename")
+        mode = profile.get("rotation_mode", DEFAULT_ROTATION_MODE)
         if mode == "rename":
             destination.replace(archive)
         else:  # ``rotation_mode`` has already been validated during config load.
@@ -397,12 +560,12 @@ class App:
             shutil.copy2(destination, archive)
             with destination.open("r+b") as active_file:
                 active_file.truncate(0)
-        self.prune_archives(destination, profile.get("rotate_keep", 10))
+        self.prune_archives(destination, profile.get("rotate_keep", DEFAULT_ROTATE_KEEP))
 
     def write_file(self, destination: Path, content: bytes, profile: dict[str, Any]) -> None:
         """Appends one delivery and rotates first when the configured size is reached."""
         destination.parent.mkdir(parents=True, exist_ok=True)
-        rotate_max_bytes = profile.get("rotate_max_bytes", 0)
+        rotate_max_bytes = profile.get("rotate_max_bytes", DEFAULT_ROTATE_MAX_BYTES)
         if destination.exists() and rotate_max_bytes:
             size = destination.stat().st_size
             # Do not rotate an empty file repeatedly when one message exceeds the limit.
@@ -485,7 +648,13 @@ class App:
         return written
 
 
-def make_handler(app: App, endpoint: str, max_body_bytes: int, trust_forwarded_for: bool = False) -> type[BaseHTTPRequestHandler]:
+def make_handler(
+    app: App,
+    endpoint: str,
+    max_body_bytes: int,
+    trust_forwarded_for: bool = False,
+    basic_auth: BasicAuth | None = None,
+) -> type[BaseHTTPRequestHandler]:
     """Builds a request-handler class bound to one application configuration.
 
     The generated handler accepts only POST requests for ``endpoint`` and a
@@ -493,6 +662,17 @@ def make_handler(app: App, endpoint: str, max_body_bytes: int, trust_forwarded_f
     trusted, the first address in ``X-Forwarded-For`` becomes the origin.
     """
     class Handler(BaseHTTPRequestHandler):
+        def require_basic_auth(self) -> bool:
+            """Challenges the caller unless the optional Basic credentials are valid."""
+            if basic_auth is None or basic_auth_is_valid(self.headers.get("Authorization"), basic_auth):
+                return False
+            self.send_response(HTTPStatus.UNAUTHORIZED)
+            self.send_header("WWW-Authenticate", f'Basic realm="{basic_auth.realm}", charset="UTF-8"')
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"basic authentication required"}\n')
+            return True
+
         def do_GET(self) -> None:
             if self.path.split("?", 1)[0] == "/healthz":
                 self.send_response(HTTPStatus.OK)
@@ -505,6 +685,8 @@ def make_handler(app: App, endpoint: str, max_body_bytes: int, trust_forwarded_f
         def do_POST(self) -> None:
             if self.path.split("?", 1)[0] != endpoint:
                 self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if self.require_basic_auth():
                 return
             try:
                 length = int(self.headers.get("Content-Length", ""))
@@ -662,6 +844,19 @@ def load_config(path: Path) -> dict[str, Any]:
             config[option] = int(config[option])
     for option in ("debug", "trust_forwarded_for"):
         config[option] = parser.getboolean("webhook", option, fallback=False)
+    config["basic_auth_enabled"] = parser.getboolean("webhook", "basic_auth_enabled", fallback=False)
+    config["basic_auth_username"] = config.get("basic_auth_username", "")
+    config["basic_auth_password_env"] = config.get("basic_auth_password_env", "WEBHOOK_BASIC_AUTH_PASSWORD")
+    config["basic_auth_realm"] = config.get("basic_auth_realm", "Webhook Intake")
+    config["basic_auth_allow_insecure"] = parser.getboolean("webhook", "basic_auth_allow_insecure", fallback=False)
+    password_file = config.get("basic_auth_password_file", "").strip()
+    if password_file:
+        password_path = Path(password_file).expanduser()
+        if not password_path.is_absolute():
+            password_path = path.parent / password_path
+        config["basic_auth_password_file"] = str(password_path)
+    else:
+        config["basic_auth_password_file"] = None
     config["tls_enabled"] = parser.getboolean("webhook", "tls_enabled", fallback=False)
     config["tls_self_signed"] = parser.getboolean("webhook", "tls_self_signed", fallback=False)
     try:
@@ -697,7 +892,23 @@ def main() -> None:
     parser.add_argument("--certbot-email", help="contact email required by Certbot")
     parser.add_argument("--certbot-staging", action="store_true", help="use the untrusted Certbot staging CA")
     parser.add_argument("--certbot-yes", action="store_true", help="skip the interactive confirmation in --certbot-mode")
+    parser.add_argument(
+        "--create-basic-auth-password-file",
+        nargs="?",
+        const=".faj383hfa",
+        metavar="PATH",
+        help="create or replace a PBKDF2 Basic Auth password file (default: .faj383hfa)",
+    )
     args = parser.parse_args()
+    if args.create_basic_auth_password_file:
+        if args.certbot_mode or args.certbot_ip or args.certbot_email or args.certbot_staging or args.certbot_yes:
+            parser.error("--create-basic-auth-password-file cannot be combined with --certbot-* options")
+        password_path = Path(args.create_basic_auth_password_file).expanduser()
+        if not password_path.is_absolute():
+            password_path = args.config.parent / password_path
+        create_basic_auth_password_file(password_path)
+        print(f"Basic Auth password hash written to {password_path} with mode 0600", flush=True)
+        return
     if args.certbot_mode:
         if not args.certbot_ip:
             parser.error("--certbot-mode requires --certbot-ip")
@@ -717,8 +928,15 @@ def main() -> None:
     if not endpoint.startswith("/"):
         raise ValueError("path must start with '/'")
     tls_context = build_tls_context(config)
+    basic_auth = load_basic_auth(config)
+    if basic_auth and not tls_context and not is_loopback_host(host) and not config["basic_auth_allow_insecure"]:
+        raise ValueError("Basic Auth requires HTTPS for a non-loopback host; enable TLS or set basic_auth_allow_insecure only in a controlled environment")
     server = ThreadingHTTPServer((host, port), make_handler(
-        app, endpoint, int(config.get("max_body_bytes", 1048576)), bool(config.get("trust_forwarded_for", False))
+        app,
+        endpoint,
+        int(config.get("max_body_bytes", 1048576)),
+        bool(config.get("trust_forwarded_for", False)),
+        basic_auth,
     ))
     if tls_context:
         server.socket = tls_context.wrap_socket(server.socket, server_side=True)
@@ -734,4 +952,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc

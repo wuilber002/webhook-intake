@@ -1,5 +1,6 @@
 import json
 import os
+import base64
 import shutil
 import ssl
 import sys
@@ -9,6 +10,7 @@ from pathlib import Path
 from http.client import HTTPConnection, HTTPSConnection
 from http.server import ThreadingHTTPServer
 from threading import Thread
+from unittest.mock import patch
 
 # Allow both ``python tests/test_webhook.py`` and unittest discovery from the
 # repository root without requiring package installation.
@@ -16,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from webhook import App, DeliveryError, build_tls_context, load_config, make_handler, profile_matches, render, update_ini_values
+from webhook import App, BasicAuth, DeliveryError, basic_auth_is_valid, build_tls_context, create_basic_auth_password_file, ensure_local_config, load_basic_auth, load_config, make_handler, password_hash_record, profile_matches, render, update_ini_values
 
 
 class WebhookTests(unittest.TestCase):
@@ -138,6 +140,16 @@ class WebhookTests(unittest.TestCase):
             self.assertIn("tls_enabled = true", updated)
             self.assertIn("tls_cert_file = ./tls/webhook-intake.crt", updated)
 
+    def test_missing_local_config_is_created_from_example(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            example = root / "config.ini.example"
+            example.write_text("[webhook]\ntls_enabled = false\n")
+            config = root / "config.ini"
+            self.assertTrue(ensure_local_config(config))
+            self.assertEqual(config.read_text(), example.read_text())
+            self.assertFalse(ensure_local_config(config))
+
     def test_rename_rotation_archives_previous_content(self):
         with tempfile.TemporaryDirectory() as directory:
             app = App({"output_dir": directory, "profiles": [{"name": "rotate", "file": "events.jsonl", "format": "jsonl", "rotate_max_bytes": 20, "rotate_keep": 2, "rotation_mode": "rename", "catch_all": True}]}, False)
@@ -160,6 +172,35 @@ class WebhookTests(unittest.TestCase):
             self.assertEqual(active.stat().st_ino, inode_before)
             self.assertEqual(active.read_text(), '{"title":"second"}\n')
             self.assertEqual(archives[0].read_text(), '{"title":"first"}\n')
+
+    def test_file_rotation_uses_defaults_when_profile_omits_rotation_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = {"file": "events.jsonl", "format": "jsonl", "catch_all": True}
+            app = App({"output_dir": directory, "profiles": [profile]}, False)
+            # Keep this test small while verifying that omitted settings use the
+            # production default path rather than silently disabling rotation.
+            with patch("webhook.DEFAULT_ROTATE_MAX_BYTES", 20):
+                app.receive(b'{"title":"first"}', "application/json")
+                app.receive(b'{"title":"second"}', "application/json")
+            archives = list(Path(directory).glob("events.*.jsonl"))
+            self.assertEqual(len(archives), 1)
+            self.assertEqual(archives[0].read_text(), '{"title":"first"}\n')
+
+    def test_profile_can_explicitly_disable_default_file_rotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = {
+                "file": "events.jsonl", "format": "jsonl", "catch_all": True,
+                "rotate_max_bytes": 0,
+            }
+            app = App({"output_dir": directory, "profiles": [profile]}, False)
+            with patch("webhook.DEFAULT_ROTATE_MAX_BYTES", 20):
+                app.receive(b'{"title":"first"}', "application/json")
+                app.receive(b'{"title":"second"}', "application/json")
+            self.assertEqual(list(Path(directory).glob("events.*.jsonl")), [])
+            self.assertEqual(
+                (Path(directory) / "events.jsonl").read_text(),
+                '{"title":"first"}\n{"title":"second"}\n',
+            )
 
     def test_rotation_prunes_archives_beyond_retention_limit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -188,6 +229,66 @@ class WebhookTests(unittest.TestCase):
                 server.shutdown()
                 thread.join()
                 server.server_close()
+
+    def test_optional_basic_auth_protects_webhook_post(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = App({"output_dir": directory, "profiles": [{"file": "all.raw", "format": "raw", "catch_all": True}]}, False)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(
+                app, "/webhook", 1024, basic_auth=BasicAuth(b"webhook", "Webhook Intake", password=b"secret")
+            ))
+            thread = Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                connection = HTTPConnection("127.0.0.1", server.server_port)
+                connection.request("POST", "/webhook", b'{"title":"denied"}')
+                response = connection.getresponse()
+                self.assertEqual(response.status, 401)
+                self.assertEqual(response.getheader("WWW-Authenticate"), 'Basic realm="Webhook Intake", charset="UTF-8"')
+                response.read()
+
+                token = base64.b64encode(b"webhook:secret").decode()
+                connection.request("POST", "/webhook", b'{"title":"allowed"}', {"Authorization": f"Basic {token}"})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 202)
+                response.read()
+                self.assertEqual((Path(directory) / "all.raw").read_bytes(), b'{"title":"allowed"}\n')
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+
+    def test_basic_auth_can_use_a_pbkdf2_password_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".faj383hfa"
+            path.write_text(password_hash_record("secret") + "\n")
+            path.chmod(0o600)
+            credentials = load_basic_auth({
+                "basic_auth_enabled": True,
+                "basic_auth_username": "webhook",
+                "basic_auth_password_file": str(path),
+                "basic_auth_password_env": "UNUSED",
+                "basic_auth_realm": "Webhook Intake",
+            })
+            valid = base64.b64encode(b"webhook:secret").decode()
+            invalid = base64.b64encode(b"webhook:wrong").decode()
+            self.assertTrue(basic_auth_is_valid(f"Basic {valid}", credentials))
+            self.assertFalse(basic_auth_is_valid(f"Basic {invalid}", credentials))
+
+    def test_password_file_creator_replaces_file_with_mode_0600(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".faj383hfa"
+            path.write_text("old")
+            with patch("webhook.getpass.getpass", side_effect=["new-secret", "new-secret"]):
+                create_basic_auth_password_file(path)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            credentials = load_basic_auth({
+                "basic_auth_enabled": True,
+                "basic_auth_username": "webhook",
+                "basic_auth_password_file": str(path),
+                "basic_auth_realm": "Webhook Intake",
+            })
+            valid = base64.b64encode(b"webhook:new-secret").decode()
+            self.assertTrue(basic_auth_is_valid(f"Basic {valid}", credentials))
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required for self-signed TLS test")
     def test_https_self_signed_certificate_accepts_message(self):

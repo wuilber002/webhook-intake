@@ -1,6 +1,8 @@
 # Webhook Intake
 
 [![Tests](https://github.com/wuilber002/webhook-intake/actions/workflows/tests.yml/badge.svg)](https://github.com/wuilber002/webhook-intake/actions/workflows/tests.yml)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Certbot 5.4+](https://img.shields.io/badge/Certbot-5.4%2B-003A70)](https://certbot.eff.org/)
 
 Leia este documento em [Português](README.pt-BR.md).
 
@@ -14,10 +16,6 @@ There is no commitment to support, service-level agreement, maintenance, or futu
 
 Before any use, users are responsible for validating behavior, security, compliance, and operational suitability for their environment. Authors and contributors are not liable for losses, damages, service interruptions, incorrect configurations, or unintended impacts arising from use of this material.
 
-## Navigation
-
-[Português](README.pt-BR.md) · [Server configuration template](config.ini.example) · [Profiles](profile.d/) · [Example profile](profile.d/profile.conf.example) · [Webhook code](webhook.py) · [Tests](tests/) · [CI](.github/workflows/tests.yml) · [License](LICENSE)
-
 ## Requirements and startup
 
 Python 3.11 or later is required. There are no external Python dependencies. OpenSSL is required only when generating a self-signed TLS certificate. Create a local configuration before starting:
@@ -29,6 +27,31 @@ python3 webhook.py --config config.ini
 
 The endpoint is `POST /webhook` and the health check is `GET /healthz`. The supplied [config.ini.example](config.ini.example) listens only on `127.0.0.1:1604` and writes to `./output/`. Copy it to `config.ini` and expose another address only behind a trusted firewall or reverse proxy.
 
+### Requirements matrix
+
+| Scenario | Required components | Network and privileges |
+| --- | --- | --- |
+| HTTP webhook or existing TLS certificate | Python 3.11+ | Allow the configured webhook port only when external senders need it. |
+| Self-signed HTTPS | Python 3.11+, OpenSSL | No extra public port is required; clients must explicitly trust the certificate. |
+| Public IP certificate through `--certbot-mode` | Python 3.11+, Certbot 5.4+ | Public static IP, inbound TCP/80 during validation, and permission to bind that port (usually root). |
+| Automated IP-certificate renewal | Certbot renewal timer/hook | Restart the webhook after renewal so it reloads the certificate. |
+| HTTP Basic Auth | Environment variable with the configured password | Use HTTPS for non-loopback exposure, or a trusted TLS proxy with loopback binding. |
+| systemd service deployment | systemd, Python 3.11+ with `venv` support | Root access is needed only to install and manage the service. |
+
+`certbot` and `openssl` are operating-system tools, not Python packages installed in this project's virtual environment. The script does not install either one automatically.
+
+### Network connectivity prerequisites
+
+Before exposing the receiver to external senders, confirm that every required path is allowed by both the operating-system firewall and the cloud/network firewall or security group:
+
+| Flow | Protocol and port | When required |
+| --- | --- | --- |
+| Sender → webhook host | TCP/1604 by default, or the configured `port` | Required for external webhook delivery. Restrict source addresses whenever possible. |
+| Certificate authority → webhook host | TCP/80 | Required only while Certbot standalone validates a public IP certificate. |
+| Webhook host → certificate authority | Outbound TCP/443 | Required for Certbot certificate requests and renewal. |
+
+For systems using firewalld, open the webhook port with `firewall-cmd --permanent --add-port=1604/tcp` followed by `firewall-cmd --reload`. Opening the host firewall alone is insufficient if an upstream firewall, router, load balancer, or cloud security group still blocks the path.
+
 To print every delivery to the terminal, including the selected profile, run:
 
 ```bash
@@ -36,6 +59,63 @@ python3 webhook.py --config config.ini --debug
 ```
 
 Host and port can also be overridden: `--host 0.0.0.0 --port 1604`.
+
+## Running as a systemd service
+
+For a long-running host, use the supplied [systemd deployment files](systemd/) rather than a Python daemon mode. `systemd` starts the process in the foreground, records its output in the journal, restarts it after an unexpected failure, and applies a restricted service account and filesystem access.
+
+The installer uses this layout by default:
+
+| Purpose | Default location |
+| --- | --- |
+| Application checkout and virtual environment | `/opt/webhook-intake` |
+| Configuration, profiles, and TLS material | `/etc/webhook-intake` |
+| Received output | `/var/lib/webhook-intake/output` |
+| Service account | `whintake` |
+
+Install the checkout under `/opt/webhook-intake`, then run the installer as root. It creates the service account and virtual environment, copies the initial configuration and shipped `.conf` profiles only when they do not yet exist, installs the units, and reloads systemd. It does not start the receiver or overwrite an existing configuration.
+
+```bash
+sudo git clone https://github.com/wuilber002/webhook-intake.git /opt/webhook-intake
+cd /opt/webhook-intake
+sudo bash ./systemd/install.sh
+sudoedit /etc/webhook-intake/config.ini
+sudo systemctl enable --now webhook-intake.service
+```
+
+Use `systemctl status webhook-intake.service` to inspect its state and `journalctl -u webhook-intake.service -f` to follow its logs. Set `debug = true` in `/etc/webhook-intake/config.ini` when temporary delivery diagnostics are needed; the debug output is recorded in the journal.
+
+The service unit intentionally permits writes only to `/var/lib/webhook-intake`. Provision TLS files before starting it: place an existing certificate and private key under `/etc/webhook-intake/tls/`, owned by `whintake`, with the private key mode set to `0600`. For a self-signed certificate, enable TLS and `tls_self_signed = true`, run the command below once, stop it with `Ctrl+C` after the certificate is created, set `tls_self_signed = false`, and then start the service:
+
+```bash
+sudo -u whintake /opt/webhook-intake/.venv/bin/python \
+  /opt/webhook-intake/webhook.py --config /etc/webhook-intake/config.ini
+```
+
+For Basic Auth in a systemd installation, create the password hash as the service account and set `basic_auth_enabled = true` in `/etc/webhook-intake/config.ini`:
+
+```bash
+sudo -u whintake /opt/webhook-intake/.venv/bin/python \
+  /opt/webhook-intake/webhook.py \
+  --create-basic-auth-password-file /etc/webhook-intake/.faj383hfa
+sudo systemctl restart webhook-intake.service
+```
+
+The system configuration template already points `basic_auth_password_file` at that file. This avoids placing a password in the systemd unit or its environment.
+
+### Certbot renewal with systemd
+
+After a successful IP-certificate request, enable the supplied timer. It runs Certbot daily with a randomized delay. When a certificate is renewed, its deploy hook copies the replacement files to `/etc/webhook-intake/tls/` with the service account ownership and restarts the receiver. Confirm the `certbot` executable is `/usr/bin/certbot` or update [the renewal unit](systemd/webhook-intake-certbot-renew.service) before installing it.
+
+```bash
+sudo /opt/webhook-intake/.venv/bin/python /opt/webhook-intake/webhook.py \
+  --config /etc/webhook-intake/config.ini --certbot-mode \
+  --certbot-ip 198.51.100.10 --certbot-email admin@example.com
+sudo systemctl enable --now webhook-intake-certbot-renew.timer
+systemctl list-timers webhook-intake-certbot-renew.timer
+```
+
+Certbot standalone temporarily needs TCP/80, so stop any other process using that port and keep it reachable during validation. Start or restart `webhook-intake.service` after the first certificate is issued.
 
 ## HTTPS
 
@@ -62,6 +142,47 @@ tls_self_signed_days = 365
 
 Self-signed certificates require [OpenSSL](https://www.openssl.org/) and are not trusted by clients by default. For a local test, use `curl -k https://127.0.0.1:1604/webhook ...`; do not use `-k` in production. For public services, use a certificate issued by a trusted authority or terminate TLS at a trusted reverse proxy.
 
+## Optional HTTP Basic Auth
+
+Basic Auth protects `POST /webhook`; `GET /healthz` remains unauthenticated for local monitoring. It is disabled by default. Enable it in the local `config.ini`:
+
+```ini
+basic_auth_enabled = true
+basic_auth_username = webhook
+basic_auth_password_env = WEBHOOK_BASIC_AUTH_PASSWORD
+basic_auth_password_file =
+basic_auth_realm = Webhook Intake
+```
+
+Set the password in the environment before starting the service:
+
+```bash
+export WEBHOOK_BASIC_AUTH_PASSWORD='use-a-long-random-secret'
+python3 webhook.py --config config.ini
+```
+
+Send an authenticated request with:
+
+```bash
+curl -u webhook:"$WEBHOOK_BASIC_AUTH_PASSWORD" https://127.0.0.1:1604/webhook ...
+```
+
+Alternatively, store only a salted password hash in a local file. This is preferred when a process environment variable is not suitable:
+
+```bash
+python3 webhook.py --create-basic-auth-password-file .faj383hfa
+```
+
+The command asks for the password twice, then atomically creates or replaces the file with mode `0600`. Configure it in `config.ini`:
+
+```ini
+basic_auth_password_file = ./.faj383hfa
+```
+
+The file uses PBKDF2-SHA256 with a random salt and is ignored by Git. When `basic_auth_password_file` is set, it takes precedence over `basic_auth_password_env`.
+
+Basic Auth encodes credentials; it does not encrypt them. The server refuses to enable it for a non-loopback HTTP listener unless `basic_auth_allow_insecure = true` is set explicitly. Use that exception only for a controlled network or when a trusted reverse proxy terminates TLS and forwards traffic to loopback.
+
 ### Public IP certificate with Certbot
 
 If a sender requires a publicly trusted certificate but connects to a public IP address instead of a hostname, use the special Certbot mode. It requires Certbot 5.4 or later, a globally routable static IP, and inbound TCP/80 available while Certbot performs standalone ACME validation:
@@ -73,6 +194,8 @@ sudo python3 webhook.py --config config.ini --certbot-mode \
 ```
 
 The script explains the operation and asks for confirmation before it contacts the CA. On success it copies the certificate and private key into `./tls/`, configures `config.ini` to enable HTTPS, and exits without starting the webhook. Use `--certbot-staging` for an initial dry run; its certificate is intentionally not publicly trusted. `--certbot-yes` is available only for a deliberate non-interactive invocation.
+
+If `config.ini` does not exist, Certbot mode creates it from `config.ini.example` before applying the TLS settings.
 
 IP certificates are short-lived. Set up Certbot renewal and restart the webhook after renewal so that it loads the replacement certificate. The generated `tls/` directory is ignored by Git.
 
@@ -159,6 +282,8 @@ rotation_mode = rename
 ```
 
 `rotate_max_bytes` is measured in bytes; `0` disables rotation. `rotate_keep` controls the number of archived files retained. Archives are named beside the active file, for example `critical.20260703T143000Z.001.jsonl`.
+
+Rotation is active by default for every `file` or `both` profile: `rotate_max_bytes = 10485760` (10 MiB), `rotate_keep = 10`, and `rotation_mode = rename`. A profile can override any of these values. Set `rotate_max_bytes = 0` explicitly to disable rotation for that profile.
 
 Two rotation modes are available:
 

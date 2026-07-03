@@ -1,0 +1,10 @@
+[Unit]
+Description=Renew Webhook Intake TLS certificate with Certbot
+Documentation=https://github.com/wuilber002/webhook-intake
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Change /usr/bin/certbot if the distribution installs Certbot elsewhere.
+ExecStart=/usr/bin/certbot renew --config-dir @CONFIG_DIR@/tls/.certbot --work-dir @CONFIG_DIR@/tls/.certbot/work --logs-dir @CONFIG_DIR@/tls/.certbot/logs --deploy-hook @HOOK_PATH@

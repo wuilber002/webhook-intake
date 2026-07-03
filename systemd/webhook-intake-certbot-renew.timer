@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily check for Webhook Intake TLS certificate renewal
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
