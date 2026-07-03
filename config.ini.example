@@ -1,0 +1,22 @@
+; Documentation: README.md (English) and README.pt-BR.md (Portuguese).
+; Generic webhook configuration template.
+; Copy this file to config.ini and adjust values for the target environment.
+[webhook]
+; Address/IP where the HTTP server listens. Keep loopback unless a trusted
+; firewall or reverse proxy is configured for external access.
+host = 127.0.0.1
+; Webhook TCP port.
+port = 1604
+; HTTP path that receives POST requests.
+path = /webhook
+; Default target for relative profile `file` values.
+output_dir = ./output
+; Maximum accepted request body size, in bytes.
+max_body_bytes = 1048576
+; When true, prints the source, selected profiles, and received body to the console.
+debug = false
+; Enable only when this webhook is behind a trusted reverse proxy.
+; When true, uses the first IP in the X-Forwarded-For header as the source.
+trust_forwarded_for = false
+; Valid *.conf files in this directory are loaded in alphabetical order.
+profile_dir = ./profile.d

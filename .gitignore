@@ -1,0 +1,22 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Messages received at runtime (keeps the empty directory in the repository)
+output/*
+!output/.gitkeep
+
+# Local configuration and common files
+config.ini
+!config.ini.example
+.env
+.env.*
+.DS_Store
