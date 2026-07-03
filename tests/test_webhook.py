@@ -1,10 +1,12 @@
 import json
 import os
+import shutil
+import ssl
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from http.client import HTTPConnection
+from http.client import HTTPConnection, HTTPSConnection
 from http.server import ThreadingHTTPServer
 from threading import Thread
 
@@ -14,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from webhook import App, DeliveryError, load_config, make_handler, profile_matches, render
+from webhook import App, DeliveryError, build_tls_context, load_config, make_handler, profile_matches, render, update_ini_values
 
 
 class WebhookTests(unittest.TestCase):
@@ -121,6 +123,21 @@ class WebhookTests(unittest.TestCase):
             self.assertEqual([profile["name"] for profile in config["profiles"]], ["base"])
             self.assertIn("requires a .jsonl or .ndjson file", config["profile_warnings"][0])
 
+    def test_ini_update_preserves_comments_and_changes_tls_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.ini"
+            path.write_text("; keep this comment\ntls_enabled = false\ntls_cert_file = old.crt\ntls_key_file = old.key\ntls_self_signed = true\n")
+            update_ini_values(path, {
+                "tls_enabled": "true",
+                "tls_cert_file": "./tls/webhook-intake.crt",
+                "tls_key_file": "./tls/webhook-intake.key",
+                "tls_self_signed": "false",
+            })
+            updated = path.read_text()
+            self.assertIn("; keep this comment", updated)
+            self.assertIn("tls_enabled = true", updated)
+            self.assertIn("tls_cert_file = ./tls/webhook-intake.crt", updated)
+
     def test_rename_rotation_archives_previous_content(self):
         with tempfile.TemporaryDirectory() as directory:
             app = App({"output_dir": directory, "profiles": [{"name": "rotate", "file": "events.jsonl", "format": "jsonl", "rotate_max_bytes": 20, "rotate_keep": 2, "rotation_mode": "rename", "catch_all": True}]}, False)
@@ -167,6 +184,36 @@ class WebhookTests(unittest.TestCase):
                 self.assertEqual(response.status, 202)
                 self.assertEqual(json.loads(response.read()), {"status": "stored", "profiles": ["all.raw"]})
                 self.assertEqual((Path(directory) / "all.raw").read_bytes(), b'{"title":"teste"}\n')
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required for self-signed TLS test")
+    def test_https_self_signed_certificate_accepts_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = App({"output_dir": directory, "profiles": [{"file": "all.raw", "format": "raw", "catch_all": True}]}, False)
+            tls_context = build_tls_context({
+                "tls_enabled": True,
+                "tls_self_signed": True,
+                "tls_cert_file": str(root / "tls" / "server.crt"),
+                "tls_key_file": str(root / "tls" / "server.key"),
+                "tls_self_signed_common_name": "127.0.0.1",
+                "tls_self_signed_days": 1,
+            })
+            self.assertTrue((root / "tls" / "server.crt").exists())
+            self.assertEqual((root / "tls" / "server.key").stat().st_mode & 0o777, 0o600)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app, "/webhook", 1024))
+            server.socket = tls_context.wrap_socket(server.socket, server_side=True)
+            thread = Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                connection = HTTPSConnection("127.0.0.1", server.server_port, context=ssl._create_unverified_context())
+                connection.request("POST", "/webhook", b'{"title":"tls"}', {"Content-Type": "application/json"})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 202)
+                self.assertEqual((root / "all.raw").read_bytes(), b'{"title":"tls"}\n')
             finally:
                 server.shutdown()
                 thread.join()

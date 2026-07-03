@@ -18,5 +18,16 @@ debug = false
 ; Enable only when this webhook is behind a trusted reverse proxy.
 ; When true, uses the first IP in the X-Forwarded-For header as the source.
 trust_forwarded_for = false
+; Enable direct HTTPS using the certificate and key paths below.
+tls_enabled = false
+; When true and both TLS files are absent, create a local self-signed certificate.
+; Self-signed certificates are for development or controlled environments only.
+tls_self_signed = false
+; Certificate and private-key paths. Relative paths use this configuration directory.
+tls_cert_file = ./tls/webhook-intake.crt
+tls_key_file = ./tls/webhook-intake.key
+; Subject name and validity period used only for self-signed certificate generation.
+tls_self_signed_common_name = localhost
+tls_self_signed_days = 365
 ; Valid *.conf files in this directory are loaded in alphabetical order.
 profile_dir = ./profile.d

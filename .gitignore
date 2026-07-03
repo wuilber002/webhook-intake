@@ -17,6 +17,7 @@ output/*
 # Local configuration and common files
 config.ini
 !config.ini.example
+tls/
 .env
 .env.*
 .DS_Store

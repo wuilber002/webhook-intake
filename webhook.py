@@ -10,7 +10,8 @@ profiles are loaded from ``*.conf`` files in ``profile_dir``. A profile can
 match payload fields, the network source, or act as a catch-all fallback.
 
 Run ``python3 webhook.py --help`` for command-line options. This module uses
-only the Python standard library and requires Python 3.11 or later.
+the Python standard library and requires Python 3.11 or later. OpenSSL is
+also required only when generating a self-signed TLS certificate.
 """
 
 from __future__ import annotations
@@ -24,7 +25,9 @@ import os
 import re
 import signal
 import shutil
+import ssl
 import stat
+import subprocess
 import sys
 import threading
 from datetime import datetime, timezone
@@ -39,6 +42,149 @@ YAML_SUFFIXES = {".yaml", ".yml"}
 
 class DeliveryError(Exception):
     """Failure in a delivery configured as required."""
+
+
+def create_self_signed_certificate(cert_file: Path, key_file: Path, common_name: str, days: int) -> None:
+    """Creates a development TLS certificate with OpenSSL and restrictive key permissions."""
+    cert_file.parent.mkdir(parents=True, exist_ok=True)
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        try:
+            ipaddress.ip_address(common_name)
+            subject_alt_name = f"IP:{common_name}"
+        except ValueError:
+            subject_alt_name = f"DNS:{common_name}"
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
+                "-keyout", str(key_file), "-out", str(cert_file), "-days", str(days),
+                "-subj", f"/CN={common_name}", "-addext", f"subjectAltName={subject_alt_name}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise ValueError("OpenSSL is required to generate a self-signed TLS certificate") from exc
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(f"failed to generate self-signed TLS certificate: {exc.stderr.strip()}") from exc
+    key_file.chmod(0o600)
+
+
+def build_tls_context(config: dict[str, Any]) -> ssl.SSLContext | None:
+    """Builds TLS configuration, optionally creating a self-signed certificate.
+
+    Existing certificate and key files are reused. If either is missing,
+    ``tls_self_signed = true`` creates both; otherwise startup fails instead
+    of silently serving plain HTTP.
+    """
+    if not config.get("tls_enabled", False):
+        return None
+    cert_file = Path(config["tls_cert_file"])
+    key_file = Path(config["tls_key_file"])
+    if not cert_file.exists() or not key_file.exists():
+        if not config.get("tls_self_signed", False):
+            raise ValueError("TLS certificate or key is missing; provide both files or enable tls_self_signed")
+        if cert_file.exists() or key_file.exists():
+            raise ValueError("cannot create a self-signed certificate when only one TLS file exists")
+        create_self_signed_certificate(
+            cert_file,
+            key_file,
+            config.get("tls_self_signed_common_name", "localhost"),
+            config.get("tls_self_signed_days", 365),
+        )
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+    return context
+
+
+def update_ini_values(path: Path, values: dict[str, str]) -> None:
+    """Updates existing INI key values without discarding comments or layout."""
+    content = path.read_text(encoding="utf-8")
+    for key, value in values.items():
+        pattern = rf"(?m)^({re.escape(key)}\s*=\s*).*$"
+        content, replacements = re.subn(pattern, rf"\g<1>{value}", content)
+        if replacements != 1:
+            raise ValueError(f"expected exactly one '{key}' setting in {path}")
+    path.write_text(content, encoding="utf-8")
+
+
+def run_certbot_mode(config_path: Path, ip_address: str, email: str, staging: bool, assume_yes: bool) -> None:
+    """Requests a public IP certificate with Certbot, configures TLS, then exits.
+
+    Certbot's standalone challenge must bind TCP/80 and be reachable from the
+    Internet. IP address certificates are short-lived, so renewal automation
+    and a service restart after renewal are still required.
+    """
+    try:
+        address = ipaddress.ip_address(ip_address)
+    except ValueError as exc:
+        raise ValueError("--certbot-ip must be a valid IPv4 or IPv6 address") from exc
+    if not address.is_global:
+        raise ValueError("--certbot-ip must be a globally routable public IP address")
+    if not email or "@" not in email:
+        raise ValueError("--certbot-email must contain a valid contact email address")
+    if not shutil.which("certbot"):
+        raise ValueError("Certbot is required; install Certbot 5.4 or later before using --certbot-mode")
+
+    tls_dir = config_path.parent / "tls"
+    certbot_dir = tls_dir / ".certbot"
+    certificate_name = "webhook-intake-ip"
+    destination_cert = tls_dir / "webhook-intake.crt"
+    destination_key = tls_dir / "webhook-intake.key"
+    environment = "staging" if staging else "production"
+    message = (
+        "Certbot mode will request a publicly trusted IP-address certificate "
+        f"for {ip_address} from the {environment} CA environment.\n"
+        "It will temporarily bind TCP/80 for ACME validation, write Certbot "
+        f"state under {certbot_dir}, copy the certificate and key to {tls_dir}, "
+        "and update config.ini to enable HTTPS.\n"
+        "IP certificates are short-lived and require automated renewal. Continue? [y/N] "
+    )
+    if not assume_yes:
+        try:
+            approved = input(message).strip().lower() in {"y", "yes"}
+        except EOFError as exc:
+            raise ValueError("interactive confirmation unavailable; rerun with --certbot-yes") from exc
+        if not approved:
+            print("Certbot mode cancelled; no certificate was requested.", flush=True)
+            return
+    else:
+        print(message.replace("Continue? [y/N] ", "Confirmed with --certbot-yes."), flush=True)
+
+    tls_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        "certbot", "certonly", "--standalone", "--non-interactive", "--agree-tos",
+        "--email", email, "--preferred-profile", "shortlived", "--ip-address", ip_address,
+        "--cert-name", certificate_name, "--config-dir", str(certbot_dir),
+        "--work-dir", str(certbot_dir / "work"), "--logs-dir", str(certbot_dir / "logs"),
+    ]
+    if staging:
+        command.append("--staging")
+    try:
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(f"Certbot failed with exit code {exc.returncode}; config.ini was not changed") from exc
+
+    issued_cert = certbot_dir / "live" / certificate_name / "fullchain.pem"
+    issued_key = certbot_dir / "live" / certificate_name / "privkey.pem"
+    if not issued_cert.is_file() or not issued_key.is_file():
+        raise ValueError("Certbot completed but did not create the expected certificate files")
+    shutil.copy2(issued_cert, destination_cert)
+    shutil.copy2(issued_key, destination_key)
+    destination_key.chmod(0o600)
+    update_ini_values(config_path, {
+        "tls_enabled": "true",
+        "tls_self_signed": "false",
+        "tls_cert_file": "./tls/webhook-intake.crt",
+        "tls_key_file": "./tls/webhook-intake.key",
+    })
+    print(
+        f"Certificate request succeeded. HTTPS is configured in {config_path}; "
+        f"certificate: {destination_cert}; key: {destination_key}",
+        flush=True,
+    )
 
 
 def get_field(value: Any, path: str) -> Any:
@@ -516,6 +662,20 @@ def load_config(path: Path) -> dict[str, Any]:
             config[option] = int(config[option])
     for option in ("debug", "trust_forwarded_for"):
         config[option] = parser.getboolean("webhook", option, fallback=False)
+    config["tls_enabled"] = parser.getboolean("webhook", "tls_enabled", fallback=False)
+    config["tls_self_signed"] = parser.getboolean("webhook", "tls_self_signed", fallback=False)
+    try:
+        config["tls_self_signed_days"] = parser.getint("webhook", "tls_self_signed_days", fallback=365)
+    except ValueError as exc:
+        raise ValueError("tls_self_signed_days must be an integer") from exc
+    if config["tls_self_signed_days"] <= 0:
+        raise ValueError("tls_self_signed_days must be greater than zero")
+    for option, default in (("tls_cert_file", "tls/webhook-intake.crt"), ("tls_key_file", "tls/webhook-intake.key")):
+        tls_path = Path(config.get(option, default)).expanduser()
+        if not tls_path.is_absolute():
+            tls_path = path.parent / tls_path
+        config[option] = str(tls_path)
+    config["tls_self_signed_common_name"] = config.get("tls_self_signed_common_name", "localhost")
     profile_dir = Path(config.get("profile_dir", "profile.d"))
     if not profile_dir.is_absolute():
         profile_dir = path.parent / profile_dir
@@ -532,7 +692,21 @@ def main() -> None:
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--certbot-mode", action="store_true", help="request a public IP certificate with Certbot, configure TLS, and exit")
+    parser.add_argument("--certbot-ip", help="public IPv4 or IPv6 address for --certbot-mode")
+    parser.add_argument("--certbot-email", help="contact email required by Certbot")
+    parser.add_argument("--certbot-staging", action="store_true", help="use the untrusted Certbot staging CA")
+    parser.add_argument("--certbot-yes", action="store_true", help="skip the interactive confirmation in --certbot-mode")
     args = parser.parse_args()
+    if args.certbot_mode:
+        if not args.certbot_ip:
+            parser.error("--certbot-mode requires --certbot-ip")
+        if not args.certbot_email:
+            parser.error("--certbot-mode requires --certbot-email")
+        run_certbot_mode(args.config, args.certbot_ip, args.certbot_email, args.certbot_staging, args.certbot_yes)
+        return
+    if args.certbot_ip or args.certbot_email or args.certbot_staging or args.certbot_yes:
+        parser.error("--certbot-* options require --certbot-mode")
     config = load_config(args.config)
     for warning in config.get("profile_warnings", []):
         print(f"Warning: {warning}", file=sys.stderr, flush=True)
@@ -542,10 +716,14 @@ def main() -> None:
     endpoint = config.get("path", "/webhook")
     if not endpoint.startswith("/"):
         raise ValueError("path must start with '/'")
+    tls_context = build_tls_context(config)
     server = ThreadingHTTPServer((host, port), make_handler(
         app, endpoint, int(config.get("max_body_bytes", 1048576)), bool(config.get("trust_forwarded_for", False))
     ))
-    print(f"Webhook escutando em http://{host}:{port}{endpoint}", flush=True)
+    if tls_context:
+        server.socket = tls_context.wrap_socket(server.socket, server_side=True)
+    scheme = "https" if tls_context else "http"
+    print(f"Webhook listening on {scheme}://{host}:{port}{endpoint}", flush=True)
     signal.signal(signal.SIGTERM, lambda *_: server.shutdown())
     try:
         server.serve_forever()

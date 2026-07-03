@@ -20,7 +20,7 @@ Before any use, users are responsible for validating behavior, security, complia
 
 ## Requirements and startup
 
-Python 3.11 or later is required. There are no external dependencies. Create a local configuration before starting:
+Python 3.11 or later is required. There are no external Python dependencies. OpenSSL is required only when generating a self-signed TLS certificate. Create a local configuration before starting:
 
 ```bash
 cp config.ini.example config.ini
@@ -37,6 +37,45 @@ python3 webhook.py --config config.ini --debug
 
 Host and port can also be overridden: `--host 0.0.0.0 --port 1604`.
 
+## HTTPS
+
+Direct HTTPS is optional. Enable it in the local `config.ini` and provide an existing certificate and key:
+
+```ini
+tls_enabled = true
+tls_cert_file = /etc/webhook-intake/fullchain.pem
+tls_key_file = /etc/webhook-intake/privkey.pem
+```
+
+The server then listens at `https://host:port/webhook` and requires TLS 1.2 or later. Keep private-key paths outside the repository.
+
+For development or a controlled internal environment, the script can create its own certificate on first startup:
+
+```ini
+tls_enabled = true
+tls_self_signed = true
+tls_cert_file = ./tls/webhook-intake.crt
+tls_key_file = ./tls/webhook-intake.key
+tls_self_signed_common_name = localhost
+tls_self_signed_days = 365
+```
+
+Self-signed certificates require [OpenSSL](https://www.openssl.org/) and are not trusted by clients by default. For a local test, use `curl -k https://127.0.0.1:1604/webhook ...`; do not use `-k` in production. For public services, use a certificate issued by a trusted authority or terminate TLS at a trusted reverse proxy.
+
+### Public IP certificate with Certbot
+
+If a sender requires a publicly trusted certificate but connects to a public IP address instead of a hostname, use the special Certbot mode. It requires Certbot 5.4 or later, a globally routable static IP, and inbound TCP/80 available while Certbot performs standalone ACME validation:
+
+```bash
+sudo python3 webhook.py --config config.ini --certbot-mode \
+  --certbot-ip 198.51.100.10 \
+  --certbot-email admin@example.com
+```
+
+The script explains the operation and asks for confirmation before it contacts the CA. On success it copies the certificate and private key into `./tls/`, configures `config.ini` to enable HTTPS, and exits without starting the webhook. Use `--certbot-staging` for an initial dry run; its certificate is intentionally not publicly trusted. `--certbot-yes` is available only for a deliberate non-interactive invocation.
+
+IP certificates are short-lived. Set up Certbot renewal and restart the webhook after renewal so that it loads the replacement certificate. The generated `tls/` directory is ignored by Git.
+
 ## Local usage
 
 From the repository root, start the receiver with debug output:
@@ -52,6 +91,8 @@ curl -i http://127.0.0.1:1604/webhook \
   -H 'Content-Type: application/json' \
   -d '{"title":"Local test","severity":"CRITICAL","body":"hello"}'
 ```
+
+With `tls_enabled = true`, use `https://` instead. Add `-k` only when testing a self-signed certificate.
 
 The matching profile writes under `output/` by default. Stop the receiver with `Ctrl+C`.
 

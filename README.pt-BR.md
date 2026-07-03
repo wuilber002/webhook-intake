@@ -20,7 +20,7 @@ Antes de qualquer utilização, cabe ao usuário validar o comportamento, a segu
 
 ## Requisitos e início
 
-Python 3.11 ou superior. Não há dependências externas. Crie uma configuração local antes de iniciar:
+Python 3.11 ou superior. Não há dependências externas de Python. OpenSSL é necessário somente para gerar certificado TLS autoassinado. Crie uma configuração local antes de iniciar:
 
 ```bash
 cp config.ini.example config.ini
@@ -37,6 +37,45 @@ python3 webhook.py --config config.ini --debug
 
 Também é possível sobrescrever host e porta: `--host 0.0.0.0 --port 1604`.
 
+## HTTPS
+
+HTTPS direto é opcional. Ative-o no `config.ini` local e informe um certificado e uma chave existentes:
+
+```ini
+tls_enabled = true
+tls_cert_file = /etc/webhook-intake/fullchain.pem
+tls_key_file = /etc/webhook-intake/privkey.pem
+```
+
+O servidor passa a escutar em `https://host:port/webhook` e exige TLS 1.2 ou superior. Mantenha os caminhos das chaves privadas fora do repositório.
+
+Para desenvolvimento ou ambiente interno controlado, o script pode criar o próprio certificado na primeira inicialização:
+
+```ini
+tls_enabled = true
+tls_self_signed = true
+tls_cert_file = ./tls/webhook-intake.crt
+tls_key_file = ./tls/webhook-intake.key
+tls_self_signed_common_name = localhost
+tls_self_signed_days = 365
+```
+
+Certificados autoassinados exigem [OpenSSL](https://www.openssl.org/) e não são confiados por clientes por padrão. Para um teste local, use `curl -k https://127.0.0.1:1604/webhook ...`; não use `-k` em produção. Para serviços públicos, use certificado emitido por uma autoridade confiável ou termine o TLS em proxy reverso confiável.
+
+### Certificado de IP público com Certbot
+
+Se um emissor exigir certificado publicamente confiável, mas conectar em um endereço IP público em vez de hostname, use o modo especial do Certbot. Ele exige Certbot 5.4 ou superior, IP estático globalmente roteável e TCP/80 de entrada disponível enquanto o Certbot realiza a validação ACME standalone:
+
+```bash
+sudo python3 webhook.py --config config.ini --certbot-mode \
+  --certbot-ip 198.51.100.10 \
+  --certbot-email admin@example.com
+```
+
+O script explica a operação e pede confirmação antes de contatar a autoridade certificadora. Em caso de sucesso, copia certificado e chave privada para `./tls/`, configura o `config.ini` para habilitar HTTPS e encerra sem iniciar o webhook. Use `--certbot-staging` para um teste inicial; o certificado emitido nesse modo não é publicamente confiável. `--certbot-yes` está disponível somente para uma execução não interativa deliberada.
+
+Certificados de IP têm curta duração. Configure a renovação do Certbot e reinicie o webhook após a renovação para que ele carregue o certificado substituto. O diretório `tls/` gerado é ignorado pelo Git.
+
 ## Uso local
 
 Na raiz do repositório, inicie o receptor com saída de depuração:
@@ -52,6 +91,8 @@ curl -i http://127.0.0.1:1604/webhook \
   -H 'Content-Type: application/json' \
   -d '{"title":"Teste local","severity":"CRITICAL","body":"olá"}'
 ```
+
+Com `tls_enabled = true`, use `https://` no lugar de `http://`. Adicione `-k` somente ao testar certificado autoassinado.
 
 O perfil correspondente grava no diretório `output/` por padrão. Pare o receptor com `Ctrl+C`.
 
