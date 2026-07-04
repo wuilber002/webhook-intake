@@ -52,6 +52,46 @@ Antes de expor o receptor para emissores externos, confirme que cada caminho nec
 
 Em sistemas com firewalld, libere a porta do webhook com `firewall-cmd --permanent --add-port=1604/tcp` e depois `firewall-cmd --reload`. Abrir somente o firewall do host não é suficiente se um firewall, roteador, balanceador ou grupo de segurança do cloud ainda bloquear o caminho.
 
+## Instalação rápida com systemd
+
+Este é o caminho mais curto para um receptor HTTPS público protegido por Basic Auth. Ele exige IP público estático, TCP/80 de entrada para validação e renovação do Certbot, Python 3.11+ com `venv`, Git e Certbot 5.4+.
+
+```bash
+sudo git clone https://github.com/wuilber002/webhook-intake.git /opt/webhook-intake
+cd /opt/webhook-intake
+sudo bash systemd/install.sh
+sudo firewall-cmd --permanent --add-port=1604/tcp
+sudo firewall-cmd --permanent --add-port=80/tcp
+sudo firewall-cmd --reload
+sudoedit /etc/webhook-intake/config.ini
+```
+
+Defina `host = 0.0.0.0` na configuração e solicite o certificado. Substitua o IP e o e-mail de exemplo:
+
+```bash
+sudo /opt/webhook-intake/.venv/bin/python /opt/webhook-intake/webhook.py \
+  --config /etc/webhook-intake/config.ini --certbot-mode \
+  --certbot-ip 198.51.100.10 --certbot-email admin@example.com
+```
+
+Crie o hash da senha. Isso ativa automaticamente o Basic Auth no arquivo INI. O usuário padrão é `webhook`; para usar outro, altere `basic_auth_username` em `/etc/webhook-intake/config.ini` antes de iniciar o serviço:
+
+```bash
+sudo -u whintake /opt/webhook-intake/.venv/bin/python \
+  /opt/webhook-intake/webhook.py \
+  --create-basic-auth-password-file /etc/webhook-intake/.faj383hfa
+sudo systemctl enable --now webhook-intake.service
+sudo systemctl enable --now webhook-intake-certbot-renew.timer
+```
+
+Teste o receptor, substituindo IP, usuário e senha. Evite colocar uma senha de produção diretamente no histórico do shell:
+
+```bash
+curl -i -u 'webhook:SUA_SENHA' https://198.51.100.10:1604/webhook \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Teste do webhook","severity":"CRITICAL","body":"olá"}'
+```
+
 Para ver cada entrega no terminal (inclusive o perfil encontrado), use:
 
 ```bash
@@ -92,7 +132,7 @@ sudo -u whintake /opt/webhook-intake/.venv/bin/python \
   /opt/webhook-intake/webhook.py --config /etc/webhook-intake/config.ini
 ```
 
-Para Basic Auth em uma instalação systemd, crie o hash da senha como a conta de serviço e defina `basic_auth_enabled = true` em `/etc/webhook-intake/config.ini`:
+Para Basic Auth em uma instalação systemd, crie o hash da senha como a conta de serviço. O comando ativa o Basic Auth em `/etc/webhook-intake/config.ini`; o usuário padrão é `webhook`. Para alterá-lo, defina `basic_auth_username = outro-usuario` nesse arquivo antes de reiniciar o serviço:
 
 ```bash
 sudo -u whintake /opt/webhook-intake/.venv/bin/python \
@@ -173,11 +213,7 @@ Como alternativa, guarde somente um hash com sal da senha em arquivo local. Esta
 python3 webhook.py --create-basic-auth-password-file .faj383hfa
 ```
 
-O comando pede a senha duas vezes e cria ou substitui o arquivo atomicamente com permissão `0600`. Configure-o no `config.ini`:
-
-```ini
-basic_auth_password_file = ./.faj383hfa
-```
+O comando pede a senha duas vezes e cria ou substitui o arquivo atomicamente com permissão `0600`, define `basic_auth_enabled = true` e registra o caminho do arquivo de senha no `config.ini`. O usuário padrão é `webhook`; altere `basic_auth_username` no `config.ini` antes de reiniciar caso necessário.
 
 O arquivo usa PBKDF2-SHA256 com sal aleatório e é ignorado pelo Git. Quando `basic_auth_password_file` está definido, ele tem prioridade sobre `basic_auth_password_env`.
 

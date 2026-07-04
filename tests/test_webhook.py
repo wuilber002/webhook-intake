@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from webhook import App, BasicAuth, DeliveryError, basic_auth_is_valid, build_tls_context, create_basic_auth_password_file, ensure_local_config, load_basic_auth, load_config, make_handler, password_hash_record, profile_matches, render, update_ini_values
+from webhook import App, BasicAuth, DeliveryError, basic_auth_is_valid, build_tls_context, create_basic_auth_password_file, enable_basic_auth, ensure_local_config, load_basic_auth, load_config, make_handler, password_hash_record, profile_matches, render, update_ini_values
 
 
 class WebhookTests(unittest.TestCase):
@@ -289,6 +289,25 @@ class WebhookTests(unittest.TestCase):
             })
             valid = base64.b64encode(b"webhook:new-secret").decode()
             self.assertTrue(basic_auth_is_valid(f"Basic {valid}", credentials))
+
+    def test_password_file_activation_enables_basic_auth_and_preserves_username(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.ini"
+            password_file = root / ".faj383hfa"
+            config.write_text(
+                "[webhook]\n"
+                "basic_auth_enabled = false\n"
+                "basic_auth_username = alert-sender\n"
+                "basic_auth_password_file =\n"
+            )
+            password_file.write_text(password_hash_record("secret") + "\n")
+            password_file.chmod(0o600)
+            self.assertEqual(enable_basic_auth(config, password_file), "alert-sender")
+            content = config.read_text()
+            self.assertIn("basic_auth_enabled = true", content)
+            self.assertIn("basic_auth_username = alert-sender", content)
+            self.assertIn(f"basic_auth_password_file = {password_file}", content)
 
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required for self-signed TLS test")
     def test_https_self_signed_certificate_accepts_message(self):

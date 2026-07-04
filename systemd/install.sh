@@ -39,7 +39,7 @@ install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$CONFIG_DIR/tls"
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$STATE_DIR/output"
 
 if [[ ! -f "$CONFIG_DIR/config.ini" ]]; then
-  install -o root -g "$SERVICE_GROUP" -m 0640 \
+  install -o root -g "$SERVICE_GROUP" -m 0660 \
     "$APP_DIR/config.ini.example" "$CONFIG_DIR/config.ini"
   # The repository template uses relative paths for standalone execution.
   # Its system-wide copy uses the service state and configuration directories.
@@ -54,6 +54,8 @@ if [[ ! -f "$CONFIG_DIR/config.ini" ]]; then
 else
   echo "Kept existing $CONFIG_DIR/config.ini"
 fi
+chown root:"$SERVICE_GROUP" "$CONFIG_DIR/config.ini"
+chmod 0660 "$CONFIG_DIR/config.ini"
 
 for profile in "$APP_DIR"/profile.d/*.conf; do
   [[ -e "$profile" ]] || continue

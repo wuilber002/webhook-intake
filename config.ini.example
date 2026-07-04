@@ -24,7 +24,8 @@ basic_auth_enabled = false
 basic_auth_username = webhook
 basic_auth_password_env = WEBHOOK_BASIC_AUTH_PASSWORD
 ; Optional PBKDF2 password-hash file. When set, it has priority over the
-; environment variable. Create it with --create-basic-auth-password-file.
+; environment variable. Creating it with --create-basic-auth-password-file
+; also enables Basic Auth in this INI file.
 basic_auth_password_file =
 basic_auth_realm = Webhook Intake
 ; Do not enable outside controlled networks. Basic Auth must use HTTPS when

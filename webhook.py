@@ -137,6 +137,28 @@ def create_basic_auth_password_file(path: Path) -> None:
         raise
 
 
+def enable_basic_auth(config_path: Path, password_path: Path) -> str:
+    """Enables file-backed Basic Auth and returns the configured username.
+
+    The password hash is created first by the caller. Updating the setting only
+    after that succeeds avoids enabling an authentication method whose password
+    file does not exist.
+    """
+    ensure_local_config(config_path)
+    parser = new_ini_parser()
+    with config_path.open(encoding="utf-8") as file:
+        parser.read_file(file)
+    if not parser.has_section("webhook"):
+        raise ValueError("the INI file must contain a [webhook] section")
+    username = parser.get("webhook", "basic_auth_username", fallback="webhook").strip() or "webhook"
+    update_ini_values(config_path, {
+        "basic_auth_enabled": "true",
+        "basic_auth_username": username,
+        "basic_auth_password_file": str(password_path),
+    })
+    return username
+
+
 def load_basic_auth(config: dict[str, Any]) -> BasicAuth | None:
     """Loads optional Basic Auth credentials, keeping the password in an environment variable."""
     if not config.get("basic_auth_enabled", False):
@@ -244,8 +266,10 @@ def update_ini_values(path: Path, values: dict[str, str]) -> None:
     """Updates existing INI key values without discarding comments or layout."""
     content = path.read_text(encoding="utf-8")
     for key, value in values.items():
-        pattern = rf"(?m)^({re.escape(key)}\s*=\s*).*$"
-        content, replacements = re.subn(pattern, rf"\g<1>{value}", content)
+        # Do not let ``\s`` consume a following newline when replacing an
+        # intentionally blank INI value such as basic_auth_password_file.
+        pattern = rf"(?m)^{re.escape(key)}[ \t]*=[^\r\n]*$"
+        content, replacements = re.subn(pattern, f"{key} = {value}", content)
         if replacements != 1:
             raise ValueError(f"expected exactly one '{key}' setting in {path}")
     path.write_text(content, encoding="utf-8")
@@ -907,7 +931,13 @@ def main() -> None:
         if not password_path.is_absolute():
             password_path = args.config.parent / password_path
         create_basic_auth_password_file(password_path)
-        print(f"Basic Auth password hash written to {password_path} with mode 0600", flush=True)
+        username = enable_basic_auth(args.config, password_path)
+        print(
+            f"Basic Auth password hash written to {password_path} with mode 0600. "
+            f"Basic Auth is now enabled in {args.config} for username '{username}'. "
+            "To change the username, set basic_auth_username in the INI file and restart the service.",
+            flush=True,
+        )
         return
     if args.certbot_mode:
         if not args.certbot_ip:
